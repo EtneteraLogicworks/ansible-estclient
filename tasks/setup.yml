@@ -1,0 +1,53 @@
+---
+# Ansible tasks
+#
+# estclient basic setup
+
+- name: estclient group
+  group:
+    name: 'estclient'
+    system: yes
+
+- name: estclient user
+  user:
+    name: 'estclient'
+    group: 'estclient'
+    groups: 'ssh'
+    home: '{{ estclient_home_dir }}'
+    shell: '/bin/sh'
+    system: yes
+
+- name: estclient directories
+  file:
+    dest: '{{ item.path }}'
+    state: directory
+    owner: 'estclient'
+    group: 'estclient'
+    mode: '{{ item.mode }}'
+  loop:
+    - path: '{{ estclient_home_dir }}'
+      mode: '0710'
+    - path: '{{ estclient_cert_dir }}'
+      mode: '0755'
+
+- name: Scripts directory
+  file:
+    dest: '/opt/scripts/'
+    state: directory
+
+- name: Install est_renew script
+  template:
+    src: 'est_client.sh.j2'
+    dest: '/opt/scripts/est_client.sh'
+    mode: '0755'
+
+- name: Allow estclient to restart services via sudo
+  template:
+    src: 'sudoers_estclient.j2'
+    dest: '/etc/sudoers.d/estclient'
+    owner: 'root'
+    group: 'root'
+    mode: '0440'
+    validate: 'visudo -cf %s'
+
+...

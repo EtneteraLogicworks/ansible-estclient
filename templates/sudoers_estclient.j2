@@ -1,0 +1,6 @@
+## sudoers
+#
+# sudo permissions for estclient user
+{% for service in est_certs_restart_units %}
+estclient ALL=(root) NOPASSWD: /bin/systemctl {{ service.action | default('restart') }} {{ service.name }}
+{% endfor %}

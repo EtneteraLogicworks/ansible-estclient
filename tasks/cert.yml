@@ -1,0 +1,42 @@
+---
+# Ansible tasks
+#
+# estclient cert configuration
+
+- set_fact:
+    estclient_cron_job: >
+      /opt/scripts/est_client.sh
+      -a {{ "rsa" if cert.rsa | default(false) else "ecdsa" }}
+      -d {{ estclient_cert_dir }}/{{ cert.name }}
+      -e {{ estclient_renew_threshold }}
+      -n {{ cert.name }}
+      -s {{ est_server_url }}
+
+- name: Directory for certificate {{ cert.name }}
+  file:
+    path: '{{ estclient_cert_dir }}/{{ cert.name }}'
+    state: directory
+    mode: '0710'
+    owner: 'estclient'
+    group: 'estclient'
+
+- name: Create certiificate CSR configruation
+  template:
+    src: 'req.cnf.j2'
+    dest: '{{ estclient_cert_dir }}/{{ cert.name }}/req.cnf'
+    owner: 'estclient'
+    group: 'estclient'
+    mode: '0644'
+
+- name: Scheldule cron task for cert renewal
+  cron:
+    name: '{{ cert.name }}'
+    hour: '{{ range(0, 23) | random( seed=cert.name ) }}'
+    minute: '{{ 59 | random( seed=cert.name ) }}'
+    user: 'estclient'
+    job: '{{ estclient_cron_job }}'
+    cron_file: 'estclient'
+  tags:
+    - cron
+
+...

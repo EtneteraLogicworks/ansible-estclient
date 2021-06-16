@@ -1,0 +1,15 @@
+---
+# Ansible vars
+#
+# estclient role variable
+
+estclient_home_dir: '/var/lib/estclient'
+estclient_cert_dir: '/var/lib/estclient/certs'
+estclient_renew_threshold: 31
+
+est_certs: []
+est_certs_restart_units: []
+
+failover_role: 'none'
+
+...

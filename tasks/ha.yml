@@ -1,0 +1,32 @@
+---
+# Ansible tasks
+#
+# estclient HA setup
+
+- name: Restrict estclient SSH access
+  blockinfile:
+    dest: '/etc/ssh/sshd_config'
+    marker: '# {mark} ssh pro estclient'
+    block: |
+      DenyUsers estclient@"!{{ hostvars[failover_mirror].ipv4_address }},*"
+  register: result_sshd
+
+- name: Restart ssh
+  service:
+    name: ssh
+    state: restarted
+  when: result_sshd is changed
+
+- name: Create SSH fingerprints
+  include_tasks: 'includes/ssh_fingerprints/main.yml'
+  vars:
+    ssh_fingerprints:
+      user: 'estclient'
+      home: '{{ estclient_home_dir }}'
+      global: yes
+  when: item_host == inventory_hostname
+  loop: '{{ ansible_play_hosts }}'
+  loop_control:
+    loop_var: item_host
+
+...

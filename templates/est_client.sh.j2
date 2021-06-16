@@ -1,0 +1,380 @@
+#!/bin/bash
+
+readonly EC_ALGORITHM='prime256v1'
+readonly RSA_BITS='4096'
+
+readonly USAGE="USAGE
+    $0 -h
+    $0 -d directory -n name -s url
+        [-a rsa|ecdsa ] [-e days] [-f] [-o curl_flags] [-v]
+
+DESCRIPTION:
+    est_client.sh uses EST protocol (RFC 7030) to securely send CSR
+    to a defined CA and obtain signed certificate afterwards.
+    CURL program is used to send the EST messages via HTTPS.
+
+    Private key is newly generated for each certificate.
+
+    Initial certificate is obtained using the EST enroll command.
+    CA may require manual authorization of this request.
+    Until this authorization is made, CA returns HTTP 202
+    pending status which is expected.
+
+    For certificate renewals EST reenroll command is used.
+    Reenroll uses the existing certificate as a client certificate
+    for authentication with the EST server endpoint. This should
+    provide adequate authentication therefore renewals are expected
+    to succeed automatically.
+
+OPTIONS:
+    -a rsa|ecdsa   Algorithm to use for tbe private key generation.
+                   Can be 'rsa' (${RSA_BITS} bits) or 'ecdsa' (${EC_ALGORITHM})
+    -d directory   Directory for private key, certificate and all support
+                   files used for the EST requests.
+    -e days        Certificate expiry threshold indicating when the script
+                   should attempt the certificate renewal (reenroll).
+                   Default is 30 days until the certificate expiry.
+    -f             Force the reenroll with no regard for expiry threshold.
+    -o curl_flags  Use this option to pass additional options to 'curl'.
+    -n name        Name of the certificate. For logging purposes only.
+    -s url         Full HTTPS URL of the EST server endpoint.
+    -v             Enable verbose output to stdout."
+
+
+function print_error() {
+    printf -- '%s\n' "${@}" >&2
+}
+
+function print_verbose() {
+    if [ "${VERBOSE}" = 'TRUE' ]; then
+        printf -- '%s\n' "${@}"
+    fi
+}
+
+function to_timestamp() {
+    date -d "$1" '+%s'
+}
+
+function get_certificate_dates() {
+    openssl x509 -noout -dates -in "${DIRECTORY}/cert.pem" || {
+        print_error "ERROR Failed to get certificate dates"
+        exit 1
+    }
+}
+
+function restart_services() {
+    print_verbose "Restarting services"
+
+{% for service in est_certs_restart_units %}
+    if systemctl is-active --quiet '{{ service.name }}'; then
+        sudo -n /bin/systemctl {{ service.action | default("restart") }} '{{ service.name }}' || {
+            print_error 'ERROR while restart command: /bin/systemctl {{ service.action | default("restart") }} {{ service.name }}'
+        }
+    fi
+{% endfor %}
+
+{% if failover_role == 'master' and failover_mirror is defined %}
+
+    # restart services on backup
+    print_verbose "Restarting services on '{{ failover_mirror }}'"
+{%   for service in est_certs_restart_units %}
+    ssh -n -o BatchMode=yes '{{ failover_mirror }}' '
+            if systemctl is-active --quiet "{{ service.name }}"; then
+                sudo -n /bin/systemctl {{ service.action | default("restart") }} "{{ service.name }}"
+            fi
+            ' || {
+        print_error 'ERROR while restart command: systemctl {{ service.action | default("restart") }} {{ service.name }} (on {{ failover_mirror }})'
+    }
+{%   endfor %}
+
+{% endif %}
+}
+
+
+function deploy() {
+    print_verbose "Deploying certs locally"
+    cp "${DIRECTORY}/req.key" "${DIRECTORY}/key.pem"
+    chown estclient:estclient "${DIRECTORY}/key.pem"
+    chmod 640 "${DIRECTORY}/key.pem"
+    base64 -d "${DIRECTORY}/response.p7b"| openssl pkcs7 -inform der -print_certs -out "${DIRECTORY}/cert.pem"
+    chown estclient:estclient "${DIRECTORY}/cert.pem"
+    chmod 644 "${DIRECTORY}/cert.pem"
+
+{% if failover_role == 'master' and failover_mirror is defined %}
+    print_verbose "Deploying certs to failover node"
+    print_verbose "Copying key.pem and cert.pem from '${DIRECTORY}' to '{{ failover_mirror }}'"
+    ssh -o BatchMode=yes -n "{{ failover_mirror }}" "mkdir -p '${DIRECTORY}'" || {
+        print_error "ERROR: Can not create '${DIRECTORY}' on '{{ failover_mirror }}'"
+    }
+    scp -q -B "${DIRECTORY}/key.pem" "${DIRECTORY}/cert.pem" "{{ failover_mirror }}:${DIRECTORY}" || {
+        print_error "ERROR: Can not copy key and cert to '{{ failover_mirror }}'"
+    }
+{% endif %}
+
+    restart_services
+}
+
+function cleanup() {
+    print_verbose "Cleaning up"
+    rm -f "${DIRECTORY}/req.key"
+    rm -f "${DIRECTORY}/req.csr"
+    rm -f "${DIRECTORY}/response.p7b"
+}
+
+function req_private_key() {
+    if [ ! -f "${DIRECTORY}/req.key" ]; then
+        print_verbose "REQ Generating new private key"
+        if [[ "${ALGORITHM}" == 'rsa' ]]; then
+            openssl genrsa -out "${DIRECTORY}/req.key" "${RSA_BITS}" >/dev/null
+        else
+            openssl ecparam -genkey -name "${EC_ALGORITHM}" 2>/dev/null | openssl ec -out "${DIRECTORY}/req.key" 2>/dev/null
+        fi
+    else
+        print_verbose "REQ Existing private key found"
+    fi
+}
+
+function req_csr() {
+    if [ ! -f "${DIRECTORY}/req.csr" ]; then
+        print_verbose "REQ Generating new CSR"
+      openssl req \
+        -new \
+        -key "${DIRECTORY}/req.key" \
+        -config "${DIRECTORY}/req.cnf" \
+        -outform der \
+        -out - | base64 > "${DIRECTORY}/req.csr"
+    else
+        print_verbose "REQ Existing CSR found"
+    fi
+}
+
+function enroll() {
+    print_verbose "Enroll: Begining process"
+    req_private_key
+    req_csr
+
+    # Clean up response file
+    rm -f "${DIRECTORY}/response.p7b"
+
+    local content_type http_code result
+
+    result=$(curl ${CURL_FLAGS} \
+        --silent \
+        --write-out "%{http_code}@%{content_type}" \
+        --output "${DIRECTORY}/response.p7b" \
+        --header 'Content-Type: application/pkcs10' \
+        --data "@${DIRECTORY}/req.csr" \
+        "${EST_URL}/simpleenroll" \
+    ) || {
+        print_error "Enroll: ERROR Problem with curl. Exit code: ${?}"
+        exit 1
+    }
+
+    http_code="${result%@*}"
+    content_type="${result#*@}"
+
+    print_verbose "Enroll: Received HTTP code: ${http_code} with content type: ${content_type}"
+
+    if [[ "${http_code}" == '200' ]] && [[ "${content_type}" =~ ^application/pkcs7-mime.* ]]; then
+        print_verbose "Enroll: Successful"
+        deploy
+        cleanup
+    elif [[ "${http_code}" == '200' ]]; then
+        print_error "Enroll: ERROR got HTTP 200 with unexpected content type: ${content_type}"
+        print_error "$(cat "${DIRECTORY}/response.p7b")"
+        exit 1
+    elif [[ "${http_code}" == '202' ]]; then
+        print_verbose "Enroll: Pending"
+        return
+    else
+        print_error "Enroll: ERROR Unexpected HTTP code: ${http_code}"
+    fi
+}
+
+function reenroll() {
+    print_verbose "Reenroll: Begining process"
+    req_private_key
+    req_csr
+
+    # Clean up response file
+    rm -f "${DIRECTORY}/response.p7b"
+
+    local content_type http_code result
+
+    result=$(curl ${CURL_FLAGS} \
+        --silent \
+        --write-out "%{http_code}@%{content_type}" \
+        --output "${DIRECTORY}/response.p7b" \
+        --header "Content-Type: application/pkcs10" \
+        --data "@${DIRECTORY}/req.csr" \
+        --key "${DIRECTORY}/key.pem" \
+        --cert "${DIRECTORY}/cert.pem" \
+        "${EST_URL}/simplereenroll" \
+    ) || {
+        print_error "Reenroll: ERROR Problem with curl. Exit code: ${?}"
+        exit 1
+    }
+
+    http_code="${result%@*}"
+    content_type="${result#*@}"
+
+    print_verbose "Reenroll: Received HTTP code: ${http_code} with content type: ${content_type}"
+
+    if [[ "${http_code}" == '200' ]] && [[ "${content_type}" =~ ^application/pkcs7-mime.* ]]; then
+        print_verbose "Reenroll: Successful"
+        deploy
+        cleanup
+    elif [[ "${http_code}" == '200' ]]; then
+        print_error "Reenroll: ERROR got HTTP 200 with unexpected content type: ${content_type}"
+        print_error "$(cat "${DIRECTORY}/response.p7b")"
+        exit 1
+    elif [[ "${http_code}" == '202' ]]; then
+        print_error "Reenroll: ERROR Requent pending"
+        exit 1
+    else
+        print_error "Reenroll: ERROR Unexpected HTTP code: ${http_code}"
+    fi
+}
+
+function check_cert() {
+
+    local dates
+    local notAfter notBefore now days_left
+
+    dates=$(get_certificate_dates)
+    notAfter=$(to_timestamp "$(sed -n 's|^notAfter=||p' <<< "$dates")")
+    notBefore=$(to_timestamp "$(sed -n 's|^notBefore=||p' <<< "$dates")")
+    now=$(to_timestamp "now")
+
+    [[ "$notBefore" -le "$now" ]] || {
+        print_error "Certificate is not yet valid"
+        return 255
+    }
+    [[ "$now" -le "$notAfter" ]] || {
+        print_error "Certificate has expired"
+        return 2
+    }
+
+    days_left=$(( (notAfter - now)/(60*60*24) ))
+    [[ "${days_left}" -ge "${RENEW_THRESHOLD}" ]] || {
+        print_verbose "Certificate will expire in ${days_left} days. Threshold reached"
+        return 1
+    }
+
+    print_verbose "Certificate will expire in ${days_left} days. Threshold not yet reached"
+    return 0
+}
+
+function missing_option_exit() {
+    print_error "ERROR: Missing required option ${1}"
+    echo "$USAGE" >&2
+    exit 1
+}
+
+function check_input() {
+    [[ -z "${DIRECTORY}" ]] && missing_option_exit "-d"
+    [[ -z "${NAME}" ]] && missing_option_exit "-n"
+    [[ -z "${EST_URL}" ]] && missing_option_exit "-s"
+
+    if [[ -n "${ALGORITHM}" && "${ALGORITHM}" != 'rsa' && "${ALGORITHM}" != 'ecdsa' ]]; then
+        print_error "ERROR: Unsupported key algorithm: ${ALGORITHM}"
+        echo "$USAGE" >&2
+        exit 1
+    fi
+
+    readonly RENEW_THRESHOLD="${EXPIRY:-30}"
+
+    print_verbose "CONFIG Certificate directory: ${DIRECTORY}"
+    print_verbose "CONFIG Certificate name: ${NAME}"
+    print_verbose "CONFIG EST Server URL: ${EST_URL}"
+    print_verbose "CONFIG Renew thresholds (days): ${RENEW_THRESHOLD}"
+
+    if [ ! -d "${DIRECTORY}" ]; then
+        print_error "ERROR: Certificate ${NAME} directory ${DIRECTORY} does not exist"
+        exit 1
+    fi
+
+    if [ ! -f "${DIRECTORY}/req.cnf" ]; then
+        print_error "REQ OpenSSL configuration file ${DIRECTORY}/req.cnf not found"
+        exit 1
+    fi
+}
+
+
+function main() {
+
+    local cert_state
+
+    while getopts 'a:d:e:fhn:o::s:v' OPT; do
+        case "$OPT" in
+            a)
+                readonly ALGORITHM="${OPTARG}"
+                ;;
+            d)
+                readonly DIRECTORY="${OPTARG}"
+                ;;
+            e)
+                readonly EXPIRY="${OPTARG}"
+                ;;
+            f)
+                readonly FORCE='TRUE'
+                ;;
+            o)
+                readonly CURL_FLAGS="${OPTARG}"
+                ;;
+            h)
+                echo "$USAGE"
+                exit 0
+                ;;
+
+            n)
+                readonly NAME="${OPTARG}"
+                ;;
+            s)
+                readonly EST_URL="${OPTARG}"
+                ;;
+            v)
+                readonly VERBOSE='TRUE'
+                ;;
+            *)
+                # error message is reported by getopts
+                return 1
+                ;;
+        esac
+    done
+    shift $(( OPTIND-1 ))
+
+    check_input
+
+    if [ -f "${DIRECTORY}/key.pem" ] && [ -f "${DIRECTORY}/cert.pem" ]; then
+        print_verbose "Certificate ${NAME} found"
+
+        check_cert
+        cert_state="${?}"
+
+        if [[ cert_state -eq '0' ]]; then
+            print_verbose "Certificate is valid and renewal is not yet necessary"
+            if [[ "${FORCE}" == 'TRUE' ]]; then
+                print_error "Renewal forced"
+                reenroll
+            fi
+        elif [[ cert_state -eq '1' ]]; then
+            print_verbose "Certificate is valid but should be renewed"
+            reenroll
+        elif [[ cert_state -eq '2' ]]; then
+            print_verbose "Certificate is not valid"
+            enroll
+        else
+            print_error "ERROR: Unexpected certificate state. Code: ${cert_state}"
+            exit 1
+        fi
+
+    else
+        print_verbose "Certificate ${NAME} not found"
+        enroll
+    fi
+
+    exit 0
+}
+
+main "$@"

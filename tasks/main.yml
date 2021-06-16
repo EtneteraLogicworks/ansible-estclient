@@ -1,0 +1,44 @@
+---
+# Ansible role
+#
+# estclient role
+
+- name: Check est_server_url
+  fail:
+    msg: "'est_server_url' must be set"
+  when: est_server_url is not defined
+  tags:
+    - estclient-ha
+    - estclient-setup
+
+
+- name: estclient setup
+  block:
+    - name: Basic setup
+      import_tasks: 'setup.yml'
+      tags:
+        - estclient-basic
+
+    - name: HA setup
+      import_tasks: 'ha.yml'
+      when: failover_role != 'none'
+      tags:
+        - estclient-ha
+
+  when: (est_certs)
+  tags:
+    - estclient-setup
+
+
+- name: estclient activation
+  block:
+    - include_tasks: 'cert.yml'
+      loop_control:
+        loop_var: cert
+      loop: '{{ est_certs }}'
+
+  when: failover_role != 'backup'
+  tags:
+    - estclient-certs
+
+...

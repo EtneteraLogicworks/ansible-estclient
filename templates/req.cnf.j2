@@ -1,0 +1,18 @@
+[req]
+distinguished_name = req_distinguished_name
+req_extensions = req_ext
+prompt = no
+
+[req_distinguished_name]
+commonName = {{ cert.site_name }}
+
+[req_ext]
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = {{ cert.site_name }}
+{% if cert.aliases is defined and cert.aliases != none %}
+{%   for alias in cert.aliases %}
+DNS.{{ loop.index0 + 2 }} = {{ alias }}
+{%   endfor %}
+{% endif %}
